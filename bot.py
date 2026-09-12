@@ -1,11 +1,13 @@
 """
 بات تلگرام برای تبدیل PDF های اسکن‌شده فارسی به متن (OCR)
+نسخه‌ی «لینک دانلود»: کاربر به‌جای آپلود مستقیم فایل، لینک دانلودش رو می‌فرسته.
+این‌طوری هیچ فایلی از تلگرام رد نمی‌شه و محدودیت ۲۰ مگابایتی تلگرام اصلاً وارد بازی نمی‌شه.
 
 نیازمندی‌های سیستمی (قبل از اجرا نصب کن):
     sudo apt-get install tesseract-ocr tesseract-ocr-fas poppler-utils
 
 نیازمندی‌های پایتون:
-    pip install python-telegram-bot pytesseract pdf2image Pillow
+    pip install -r requirements.txt
 
 اجرا:
     export BOT_TOKEN="توکن بات شما"
@@ -14,12 +16,14 @@
 
 import os
 import io
+import re
 import logging
 import tempfile
 import asyncio
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 
+import requests
 import pytesseract
 from pdf2image import convert_from_path, pdfinfo_from_path
 from PIL import Image
@@ -39,16 +43,10 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# آدرس Bot API سرور محلی (برای فایل‌های حجیم بالای 20 مگابایت اجباریه)
-# نمونه: "http://localhost:8081/bot"  و  "http://localhost:8081/file/bot"
-LOCAL_API_BASE_URL = os.environ.get("LOCAL_API_BASE_URL")
-LOCAL_API_BASE_FILE_URL = os.environ.get("LOCAL_API_BASE_FILE_URL")
-
 # زبان OCR: فارسی. اگه سند ترکیبی فارسی/انگلیسی است می‌تونی بذاری "fas+eng"
 OCR_LANG = "fas"
 
 # DPI تبدیل PDF به عکس — بالاتر یعنی دقت بیشتر ولی کندتر و حافظه‌برتر
-# برای فایل‌های خیلی حجیم پیشنهاد می‌شه 200 باشه، نه 300
 CONVERT_DPI = 200
 
 # چند صفحه رو با هم به عکس تبدیل کنیم (نه کل PDF یه‌جا) — کنترل مصرف حافظه
@@ -56,6 +54,70 @@ CHUNK_SIZE = 10
 
 # چند صفحه رو موازی OCR کنیم — بسته به تعداد هسته CPU سرورت تنظیم کن
 OCR_WORKERS = min(4, os.cpu_count() or 2)
+
+# حداکثر حجم فایلی که دانلود می‌کنیم (بایت) — برای جلوگیری از پر شدن دیسک سرور
+MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 گیگابایت
+
+URL_PATTERN = re.compile(r"https?://\S+")
+DRIVE_PATTERNS = [
+    re.compile(r"drive\.google\.com/file/d/([a-zA-Z0-9_-]+)"),
+    re.compile(r"drive\.google\.com/open\?id=([a-zA-Z0-9_-]+)"),
+    re.compile(r"[?&]id=([a-zA-Z0-9_-]+)"),
+]
+
+
+def _extract_drive_id(url: str):
+    if "drive.google.com" not in url:
+        return None
+    for pattern in DRIVE_PATTERNS:
+        m = pattern.search(url)
+        if m:
+            return m.group(1)
+    return None
+
+
+def download_from_url(url: str, dest_path: str, progress_callback=None) -> None:
+    """
+    فایل رو از یه لینک مستقیم یا لینک اشتراک‌گذاری Google Drive دانلود می‌کنه.
+    به‌صورت استریم می‌نویسه رو دیسک تا کل فایل تو حافظه نره.
+    """
+    session = requests.Session()
+    drive_id = _extract_drive_id(url)
+
+    if drive_id:
+        base = "https://drive.google.com/uc?export=download"
+        response = session.get(base, params={"id": drive_id}, stream=True)
+
+        # فایل‌های حجیم گوگل‌درایو یه صفحه تأیید نشون می‌دن؛ باید توکنش رو بگیریم
+        token = None
+        for key, value in response.cookies.items():
+            if key.startswith("download_warning"):
+                token = value
+                break
+        if token:
+            response = session.get(
+                base, params={"id": drive_id, "confirm": token}, stream=True
+            )
+    else:
+        response = session.get(url, stream=True)
+
+    response.raise_for_status()
+
+    downloaded = 0
+    last_reported_mb = 0
+    with open(dest_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+            if not chunk:
+                continue
+            f.write(chunk)
+            downloaded += len(chunk)
+            if downloaded > MAX_DOWNLOAD_BYTES:
+                raise ValueError("حجم فایل از حد مجاز (۲ گیگابایت) بیشتر شد.")
+            if progress_callback:
+                mb = downloaded // (1024 * 1024)
+                if mb - last_reported_mb >= 20:
+                    last_reported_mb = mb
+                    progress_callback(mb)
 
 
 def _ocr_single_image_bytes(png_bytes: bytes) -> str:
@@ -68,8 +130,6 @@ def ocr_pdf_streaming(pdf_path: str, out_path: str, status_callback=None) -> int
     """
     PDF رو دسته‌دسته (CHUNK_SIZE صفحه در هر دسته) به عکس تبدیل می‌کنه،
     هر دسته رو موازی OCR می‌کنه و نتیجه رو بلافاصله رو دیسک می‌نویسه.
-    این‌طوری حافظه هیچ‌وقت کل فایل رو نگه نمی‌داره و اگه یه‌جا قطع بشه
-    صفحات قبلی از دست نمی‌رن. تعداد کل صفحات رو برمی‌گردونه.
     """
     info = pdfinfo_from_path(pdf_path)
     total_pages = info["Pages"]
@@ -80,12 +140,10 @@ def ocr_pdf_streaming(pdf_path: str, out_path: str, status_callback=None) -> int
         for start in range(1, total_pages + 1, CHUNK_SIZE):
             end = min(start + CHUNK_SIZE - 1, total_pages)
 
-            # فقط همین بازه از صفحات به عکس تبدیل می‌شه، نه کل فایل
             images = convert_from_path(
                 pdf_path, dpi=CONVERT_DPI, first_page=start, last_page=end
             )
 
-            # عکس‌ها رو به bytes تبدیل می‌کنیم تا بین پردازش‌ها قابل ارسال باشن
             image_bytes_list = []
             for img in images:
                 buf = io.BytesIO()
@@ -106,36 +164,45 @@ def ocr_pdf_streaming(pdf_path: str, out_path: str, status_callback=None) -> int
     return total_pages
 
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    doc = update.message.document
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (update.message.text or "").strip()
+    match = URL_PATTERN.search(text)
 
-    if not doc:
-        return
-
-    file_name = doc.file_name or "file"
-    if not file_name.lower().endswith(".pdf"):
+    if not match:
         await update.message.reply_text(
-            "فعلاً فقط فایل PDF پشتیبانی می‌شه. لطفاً یه فایل PDF بفرست."
+            "یه لینک دانلود PDF (مثلاً لینک اشتراک‌گذاری Google Drive یا هر "
+            "لینک مستقیم دیگه) برام بفرست تا متنش رو استخراج کنم."
         )
         return
 
-    status_msg = await update.message.reply_text(
-        "📥 فایل دریافت شد. در حال دانلود..."
-    )
+    url = match.group(0)
+    status_msg = await update.message.reply_text("📥 در حال دانلود فایل از لینک...")
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        pdf_path = Path(tmp_dir) / file_name
-        tg_file = await doc.get_file()
-        await tg_file.download_to_drive(custom_path=str(pdf_path))
-
-        await status_msg.edit_text("🔍 در حال تبدیل PDF به تصویر و اجرای OCR...")
+        pdf_path = Path(tmp_dir) / "input.pdf"
 
         loop = asyncio.get_event_loop()
+
+        def dl_progress(mb):
+            asyncio.run_coroutine_threadsafe(
+                status_msg.edit_text(f"📥 در حال دانلود... {mb} مگابایت گرفته شد"),
+                loop,
+            )
+
+        try:
+            await loop.run_in_executor(
+                None, download_from_url, url, str(pdf_path), dl_progress
+            )
+        except Exception as e:
+            logger.exception("Download failed")
+            await status_msg.edit_text(f"❌ دانلود فایل شکست خورد: {e}")
+            return
+
+        await status_msg.edit_text("🔍 در حال تبدیل PDF به تصویر و اجرای OCR...")
 
         last_reported = {"page": 0}
 
         def status_callback(current_page, total_pages):
-            # برای فایل‌های حجیم هر ۵۰ صفحه یا در صفحه آخر آپدیت بده
             if current_page - last_reported["page"] >= 50 or current_page == total_pages:
                 last_reported["page"] = current_page
                 asyncio.run_coroutine_threadsafe(
@@ -145,11 +212,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     loop,
                 )
 
-        out_path = Path(tmp_dir) / f"{Path(file_name).stem}.txt"
+        out_path = Path(tmp_dir) / "result.txt"
 
         try:
-            # OCR کار سنگین CPU هست، تو thread جدا اجرا می‌کنیم تا بات بلاک نشه
-            # نتیجه به‌صورت تدریجی رو دیسک نوشته می‌شه (ocr_pdf_streaming)
             await loop.run_in_executor(
                 None, ocr_pdf_streaming, str(pdf_path), str(out_path), status_callback
             )
@@ -177,7 +242,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "یه فایل PDF اسکن‌شده برام بفرست تا متنش رو استخراج کنم."
+        "یه لینک دانلود PDF برام بفرست (نه خود فایل) تا متنش رو استخراج کنم."
     )
 
 
@@ -186,27 +251,11 @@ def main():
         raise RuntimeError("متغیر محیطی BOT_TOKEN تنظیم نشده.")
 
     builder = Application.builder().token(BOT_TOKEN)
-
-    # برای فایل‌های بالای 20 مگابایت، باید Bot API سرور محلی راه‌اندازی شده باشه
-    # و آدرسش رو با LOCAL_API_BASE_URL / LOCAL_API_BASE_FILE_URL بدی
-    if LOCAL_API_BASE_URL and LOCAL_API_BASE_FILE_URL:
-        builder = builder.base_url(LOCAL_API_BASE_URL).base_file_url(
-            LOCAL_API_BASE_FILE_URL
-        )
-        logger.info("در حال استفاده از Bot API سرور محلی: %s", LOCAL_API_BASE_URL)
-    else:
-        logger.warning(
-            "LOCAL_API_BASE_URL تنظیم نشده — با API ابری تلگرام، دانلود فایل‌های "
-            "بالای 20 مگابایت شکست می‌خوره."
-        )
-
-    # تایم‌اوت‌های بالاتر برای دانلود/آپلود فایل‌های حجیم
     builder = builder.read_timeout(120).write_timeout(120).connect_timeout(60)
-
     app = builder.build()
 
-    app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
-    app.add_handler(MessageHandler(~filters.Document.PDF, handle_other))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(~filters.TEXT, handle_other))
 
     logger.info("بات در حال اجراست...")
     app.run_polling()
