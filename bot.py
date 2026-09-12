@@ -26,7 +26,7 @@ from concurrent.futures import ProcessPoolExecutor
 import requests
 import pytesseract
 from pdf2image import convert_from_path, pdfinfo_from_path
-from PIL import Image
+from PIL import Image, ImageOps, ImageFilter
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -47,13 +47,18 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OCR_LANG = "fas"
 
 # DPI تبدیل PDF به عکس — بالاتر یعنی دقت بیشتر ولی کندتر و حافظه‌برتر
-CONVERT_DPI = 200
+# چون دقت اولویته، رو 300 گذاشتیمش
+CONVERT_DPI = 300
 
 # چند صفحه رو با هم به عکس تبدیل کنیم (نه کل PDF یه‌جا) — کنترل مصرف حافظه
-CHUNK_SIZE = 10
+# با DPI بالاتر، دسته‌ها رو کوچیک‌تر نگه می‌داریم تا حافظه سرور (مثلاً 1GB رو Railway) پر نشه
+CHUNK_SIZE = 5
 
-# چند صفحه رو موازی OCR کنیم — بسته به تعداد هسته CPU سرورت تنظیم کن
-OCR_WORKERS = min(4, os.cpu_count() or 2)
+# چند صفحه رو موازی OCR کنیم — با DPI بالا و RAM محدود سرور، محافظه‌کارانه نگه داشته شده
+OCR_WORKERS = min(2, os.cpu_count() or 1)
+
+# تنظیمات Tesseract: oem 1 = موتور LSTM (دقت بهتر)، psm 6 = فرض یه بلوک متن یکنواخت
+TESSERACT_CONFIG = "--oem 1 --psm 6"
 
 # حداکثر حجم فایلی که دانلود می‌کنیم (بایت) — برای جلوگیری از پر شدن دیسک سرور
 MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 گیگابایت
@@ -120,10 +125,23 @@ def download_from_url(url: str, dest_path: str, progress_callback=None) -> None:
                     progress_callback(mb)
 
 
+def _preprocess_image(img: Image.Image) -> Image.Image:
+    """
+    قبل از OCR، تصویر رو برای خوانایی بهتر آماده می‌کنه:
+    سیاه‌وسفید + افزایش کنتراست خودکار + شارپ کردن جزئی.
+    این کار رو اسکن‌های کدر/کم‌نور معمولاً دقت رو محسوس بالا می‌بره.
+    """
+    gray = ImageOps.grayscale(img)
+    gray = ImageOps.autocontrast(gray, cutoff=1)
+    gray = gray.filter(ImageFilter.SHARPEN)
+    return gray
+
+
 def _ocr_single_image_bytes(png_bytes: bytes) -> str:
     """یک صفحه رو OCR می‌کنه. تو یه پردازش جدا اجرا می‌شه (برای موازی‌سازی)."""
     img = Image.open(io.BytesIO(png_bytes))
-    return pytesseract.image_to_string(img, lang=OCR_LANG)
+    img = _preprocess_image(img)
+    return pytesseract.image_to_string(img, lang=OCR_LANG, config=TESSERACT_CONFIG)
 
 
 def ocr_pdf_streaming(pdf_path: str, out_path: str, status_callback=None) -> int:
